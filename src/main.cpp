@@ -39,23 +39,32 @@
 #define MQTT_PASSWORD ""
 #endif
 
+#ifndef CAM_STREAM_URL
+#define CAM_STREAM_URL "http://192.168.0.196/stream"
+#endif
+
+#ifndef CAM_SNAPSHOT_URL
+#define CAM_SNAPSHOT_URL "http://192.168.0.196/capture"
+#endif
+
 
 // --- CONFIGURATION ---
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 const int UDP_PORT = 4210;
-const char* camStreamURL = "http://192.168.0.196/stream";      // ESP32-CAM stream endpoint
-const char* camSnapshotURL = "http://192.168.0.196/capture"; // Optional snapshot endpoint
+const char* defaultCamStreamURL = CAM_STREAM_URL;      // ESP32-CAM stream endpoint
+const char* defaultCamSnapshotURL = CAM_SNAPSHOT_URL;  // Optional snapshot endpoint
 
-const char* mqttHost = MQTT_HOST;
-const uint16_t mqttPort = MQTT_PORT;
-const char* mqttUser = MQTT_USER;
-const char* mqttPassword = MQTT_PASSWORD;
+const char* defaultMqttHost = MQTT_HOST;
+const uint16_t defaultMqttPort = MQTT_PORT;
+const char* defaultMqttUser = MQTT_USER;
+const char* defaultMqttPassword = MQTT_PASSWORD;
 const char* mqttClientIdBase = "4indisplay";
 const unsigned long MQTT_RETRY_MS = 5000;
 const char* TZ_INFO = "CST6CDT,M3.2.0/2,M11.1.0/2";
 const char* MQTT_STATUS_TOPIC = "gate/status";
 const char* MQTT_LOG_TOPIC = "gate/log";
+const char* CONFIG_PATH = "/config.json";
 
 const bool RUN_TOUCH_CALIBRATION = false;
 
@@ -85,6 +94,10 @@ bool connectMqtt(unsigned long timeoutMs);
 const char* mqttStateText(int8_t state);
 bool attemptMqttConnect();
 String sanitizeMqttField(const char* raw);
+void setDefaultRuntimeConfig();
+bool loadRuntimeConfig();
+bool saveRuntimeConfig();
+void applyRuntimeConfig();
 void handleTouch(uint16_t x, uint16_t y);
 void drawMenu();
 void drawMenuButton(int pos, String label, uint16_t color);
@@ -94,10 +107,21 @@ void publishStatus(bool retain);
 void publishLogEvent(const String &entry);
 void handleRoot();
 void handleStatusJson();
+void handleGetConfig();
+void handleSaveConfig();
 void handleLog();
 void handleEraseLog();
 void calibrateTouch();
 void testTouchSPI();  // Debug function from touch_debug.cpp
+
+struct RuntimeConfig {
+  String mqttHost;
+  uint16_t mqttPort;
+  String mqttUser;
+  String mqttPassword;
+  String camStreamURL;
+  String camSnapshotURL;
+};
 
 // PNG streaming callbacks
 void * myOpen(const char *filename, int32_t *size);
@@ -167,6 +191,7 @@ unsigned long lastWeatherTime = 0;
 unsigned long lastPacketTime = 0;
 int gateState = 2; // 0=Closed, 1=Open, 2=Lost Signal
 int lastDrawnGate = -1;
+RuntimeConfig runtimeConfig;
 
 // TJpg_Decoder Callback
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
@@ -275,6 +300,8 @@ void setup() {
 
       webServer.on("/", handleRoot);
       webServer.on("/status", handleStatusJson);
+      webServer.on("/config", HTTP_GET, handleGetConfig);
+      webServer.on("/config", HTTP_POST, handleSaveConfig);
       webServer.on("/log", handleLog);
       webServer.on("/erase", HTTP_POST, handleEraseLog);
       webServer.begin();
@@ -282,7 +309,9 @@ void setup() {
       Serial.println(WiFi.localIP());
     }
 
-  mqttClient.setServer(mqttHost, mqttPort);
+  setDefaultRuntimeConfig();
+  loadRuntimeConfig();
+  applyRuntimeConfig();
   mqttClient.setSocketTimeout(5);
   mqttClient.setKeepAlive(30);
   mqttConnected = connectMqtt(8000);
@@ -466,6 +495,100 @@ String sanitizeMqttField(const char* raw) {
   return value;
 }
 
+void setDefaultRuntimeConfig() {
+  runtimeConfig.mqttHost = defaultMqttHost;
+  runtimeConfig.mqttPort = defaultMqttPort;
+  runtimeConfig.mqttUser = defaultMqttUser;
+  runtimeConfig.mqttPassword = defaultMqttPassword;
+  runtimeConfig.camStreamURL = defaultCamStreamURL;
+  runtimeConfig.camSnapshotURL = defaultCamSnapshotURL;
+}
+
+void applyRuntimeConfig() {
+  mqttClient.setServer(runtimeConfig.mqttHost.c_str(), runtimeConfig.mqttPort);
+}
+
+bool loadRuntimeConfig() {
+  if (!LittleFS.begin()) {
+    Serial.println("[CFG] LittleFS mount failed, using defaults");
+    return false;
+  }
+
+  if (!LittleFS.exists(CONFIG_PATH)) {
+    Serial.println("[CFG] No config file, using defaults");
+    return false;
+  }
+
+  File file = LittleFS.open(CONFIG_PATH, "r");
+  if (!file) {
+    Serial.println("[CFG] Failed to open config file, using defaults");
+    return false;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err) {
+    Serial.println("[CFG] Invalid config JSON, using defaults");
+    return false;
+  }
+
+  String mqttHost = String(doc["mqttHost"] | runtimeConfig.mqttHost.c_str());
+  mqttHost.trim();
+  if (mqttHost.length() > 0) runtimeConfig.mqttHost = mqttHost;
+
+  uint16_t mqttPort = (uint16_t)(doc["mqttPort"] | runtimeConfig.mqttPort);
+  if (mqttPort > 0) runtimeConfig.mqttPort = mqttPort;
+
+  runtimeConfig.mqttUser = String(doc["mqttUser"] | runtimeConfig.mqttUser.c_str());
+  runtimeConfig.mqttPassword = String(doc["mqttPassword"] | runtimeConfig.mqttPassword.c_str());
+
+  String camStreamURL = String(doc["camStreamURL"] | runtimeConfig.camStreamURL.c_str());
+  camStreamURL.trim();
+  if (camStreamURL.length() > 0) runtimeConfig.camStreamURL = camStreamURL;
+
+  String camSnapshotURL = String(doc["camSnapshotURL"] | runtimeConfig.camSnapshotURL.c_str());
+  camSnapshotURL.trim();
+  if (camSnapshotURL.length() > 0) runtimeConfig.camSnapshotURL = camSnapshotURL;
+
+  Serial.printf("[CFG] Loaded config: mqtt=%s:%u cam=%s\n",
+                runtimeConfig.mqttHost.c_str(),
+                runtimeConfig.mqttPort,
+                runtimeConfig.camStreamURL.c_str());
+  return true;
+}
+
+bool saveRuntimeConfig() {
+  if (!LittleFS.begin()) {
+    Serial.println("[CFG] LittleFS mount failed, cannot save config");
+    return false;
+  }
+
+  File file = LittleFS.open(CONFIG_PATH, "w");
+  if (!file) {
+    Serial.println("[CFG] Failed to open config file for write");
+    return false;
+  }
+
+  JsonDocument doc;
+  doc["mqttHost"] = runtimeConfig.mqttHost;
+  doc["mqttPort"] = runtimeConfig.mqttPort;
+  doc["mqttUser"] = runtimeConfig.mqttUser;
+  doc["mqttPassword"] = runtimeConfig.mqttPassword;
+  doc["camStreamURL"] = runtimeConfig.camStreamURL;
+  doc["camSnapshotURL"] = runtimeConfig.camSnapshotURL;
+
+  size_t written = serializeJson(doc, file);
+  file.close();
+  if (written == 0) {
+    Serial.println("[CFG] Failed to write config JSON");
+    return false;
+  }
+
+  Serial.println("[CFG] Config saved");
+  return true;
+}
+
 const char* mqttStateText(int8_t state) {
   switch (state) {
     case MQTT_CONNECTION_TIMEOUT: return "Connection timeout";
@@ -484,8 +607,8 @@ const char* mqttStateText(int8_t state) {
 
 bool attemptMqttConnect() {
   String clientId = String(mqttClientIdBase) + "-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFF), HEX);
-  String mqttUserSanitized = sanitizeMqttField(mqttUser);
-  String mqttPasswordSanitized = sanitizeMqttField(mqttPassword);
+  String mqttUserSanitized = sanitizeMqttField(runtimeConfig.mqttUser.c_str());
+  String mqttPasswordSanitized = sanitizeMqttField(runtimeConfig.mqttPassword.c_str());
   bool useAuth = mqttUserSanitized.length() > 0;
   bool ok = useAuth
     ? mqttClient.connect(clientId.c_str(), mqttUserSanitized.c_str(), mqttPasswordSanitized.c_str())
@@ -496,8 +619,8 @@ bool attemptMqttConnect() {
     Serial.printf("[MQTT] Connect failed: state=%d (%s) host=%s port=%u auth=%s\n",
                   state,
                   mqttStateText(state),
-                  mqttHost,
-                  mqttPort,
+                  runtimeConfig.mqttHost.c_str(),
+                  runtimeConfig.mqttPort,
                   useAuth ? "on" : "off");
   } else {
     Serial.printf("[MQTT] Connected: clientId=%s\n", clientId.c_str());
@@ -648,7 +771,7 @@ void updateCameraFeed() {
 
   if (!camStreamReady || !camClient.connected()) {
     camClient.stop();
-    camStreamReady = parseHttpUrl(camStreamURL, camParts);
+    camStreamReady = parseHttpUrl(runtimeConfig.camStreamURL.c_str(), camParts);
     if (!camStreamReady) return;
 
     if (!camClient.connect(camParts.host.c_str(), camParts.port)) {
@@ -1102,6 +1225,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
     button:hover { border-color: var(--accent); }
     pre { white-space: pre-wrap; background: #0b1220; padding: 12px; border-radius: 10px; border: 1px solid #2b3246; color: var(--text); max-height: 320px; overflow: auto; }
     .muted { color: var(--muted); font-size: 12px; }
+    label { display:block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+    input { width: 100%; background: #0b1220; color: var(--text); border: 1px solid #2b3246; padding: 10px 12px; border-radius: 10px; margin-bottom: 10px; }
+    .ok { color: var(--accent); }
+    .warn { color: var(--warn); }
   </style>
 </head>
 <body>
@@ -1134,6 +1261,28 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div style="height: 10px"></div>
       <pre id="log">Loading...</pre>
     </section>
+
+    <section class="card">
+      <div class="row" style="justify-content: space-between; align-items: center;">
+        <strong>Runtime Config</strong>
+        <button id="saveConfig">Save Config</button>
+      </div>
+      <div style="height: 10px"></div>
+      <label for="mqttHost">MQTT Host/IP</label>
+      <input id="mqttHost" type="text" placeholder="192.168.0.19" />
+      <label for="mqttPort">MQTT Port</label>
+      <input id="mqttPort" type="number" min="1" max="65535" placeholder="1883" />
+      <label for="mqttUser">MQTT Username</label>
+      <input id="mqttUser" type="text" placeholder="gate" />
+      <label for="mqttPassword">MQTT Password (leave blank to keep current)</label>
+      <input id="mqttPassword" type="password" placeholder="(unchanged)" />
+      <label for="clearMqttPassword"><input id="clearMqttPassword" type="checkbox" style="width:auto; margin-right:8px;" />Clear MQTT Password</label>
+      <label for="camStreamURL">Camera Stream URL</label>
+      <input id="camStreamURL" type="text" placeholder="http://192.168.0.196/stream" />
+      <label for="camSnapshotURL">Camera Snapshot URL</label>
+      <input id="camSnapshotURL" type="text" placeholder="http://192.168.0.196/capture" />
+      <div class="muted" id="cfgMsg">Config not loaded yet.</div>
+    </section>
   </main>
 
   <script>
@@ -1158,15 +1307,66 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('log').textContent = text || 'No log entries.';
     }
 
+    async function loadConfig() {
+      const res = await fetch('/config');
+      if (!res.ok) throw new Error('Failed to load config');
+      const cfg = await res.json();
+      document.getElementById('mqttHost').value = cfg.mqttHost || '';
+      document.getElementById('mqttPort').value = cfg.mqttPort || 1883;
+      document.getElementById('mqttUser').value = cfg.mqttUser || '';
+      document.getElementById('mqttPassword').value = '';
+      document.getElementById('clearMqttPassword').checked = false;
+      document.getElementById('camStreamURL').value = cfg.camStreamURL || '';
+      document.getElementById('camSnapshotURL').value = cfg.camSnapshotURL || '';
+      const msg = document.getElementById('cfgMsg');
+      msg.textContent = cfg.mqttPasswordSet ? 'Config loaded. Password is stored.' : 'Config loaded. No MQTT password stored.';
+      msg.className = 'muted';
+    }
+
+    async function saveConfig() {
+      const payload = {
+        mqttHost: document.getElementById('mqttHost').value.trim(),
+        mqttPort: Number(document.getElementById('mqttPort').value || 1883),
+        mqttUser: document.getElementById('mqttUser').value.trim(),
+        camStreamURL: document.getElementById('camStreamURL').value.trim(),
+        camSnapshotURL: document.getElementById('camSnapshotURL').value.trim()
+      };
+
+      const mqttPassword = document.getElementById('mqttPassword').value;
+      const clearMqttPassword = document.getElementById('clearMqttPassword').checked;
+      if (mqttPassword.length > 0) payload.mqttPassword = mqttPassword;
+      if (clearMqttPassword) payload.clearMqttPassword = true;
+
+      const res = await fetch('/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json();
+      const msg = document.getElementById('cfgMsg');
+      if (!res.ok || !body.ok) {
+        msg.textContent = body.error || 'Failed to save config.';
+        msg.className = 'muted warn';
+        return;
+      }
+      msg.textContent = 'Config saved and applied.';
+      msg.className = 'muted ok';
+      document.getElementById('mqttPassword').value = '';
+      document.getElementById('clearMqttPassword').checked = false;
+      loadStatus();
+    }
+
     document.getElementById('refresh').addEventListener('click', () => { loadStatus(); loadLog(); });
     document.getElementById('erase').addEventListener('click', async () => {
       if (!confirm('Erase the activity log?')) return;
       await fetch('/erase', { method: 'POST' });
       loadLog();
     });
+    document.getElementById('saveConfig').addEventListener('click', saveConfig);
 
     loadStatus();
     loadLog();
+    loadConfig();
     setInterval(loadStatus, 5000);
   </script>
 </body>
@@ -1197,6 +1397,87 @@ void handleStatusJson() {
   payload += "\"time\":\"" + timeText + "\"";
   payload += "}";
   webServer.send(200, "application/json", payload);
+}
+
+void handleGetConfig() {
+  JsonDocument doc;
+  doc["mqttHost"] = runtimeConfig.mqttHost;
+  doc["mqttPort"] = runtimeConfig.mqttPort;
+  doc["mqttUser"] = runtimeConfig.mqttUser;
+  doc["mqttPasswordSet"] = runtimeConfig.mqttPassword.length() > 0;
+  doc["camStreamURL"] = runtimeConfig.camStreamURL;
+  doc["camSnapshotURL"] = runtimeConfig.camSnapshotURL;
+  String payload;
+  serializeJson(doc, payload);
+  webServer.send(200, "application/json", payload);
+}
+
+void handleSaveConfig() {
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing JSON body\"}");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, webServer.arg("plain"));
+  if (err) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid JSON\"}");
+    return;
+  }
+
+  String mqttHost = String(doc["mqttHost"] | runtimeConfig.mqttHost.c_str());
+  mqttHost.trim();
+  if (mqttHost.length() == 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"MQTT host is required\"}");
+    return;
+  }
+
+  uint32_t mqttPortRaw = (uint32_t)(doc["mqttPort"] | runtimeConfig.mqttPort);
+  if (mqttPortRaw == 0 || mqttPortRaw > 65535) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"MQTT port must be 1-65535\"}");
+    return;
+  }
+
+  runtimeConfig.mqttHost = mqttHost;
+  runtimeConfig.mqttPort = (uint16_t)mqttPortRaw;
+
+  String mqttUser = String(doc["mqttUser"] | runtimeConfig.mqttUser.c_str());
+  mqttUser.trim();
+  runtimeConfig.mqttUser = mqttUser;
+
+  bool clearMqttPassword = doc["clearMqttPassword"] | false;
+  if (clearMqttPassword) {
+    runtimeConfig.mqttPassword = "";
+  } else if (doc["mqttPassword"].is<const char*>()) {
+    runtimeConfig.mqttPassword = String((const char*)doc["mqttPassword"]);
+  }
+
+  String camStreamURL = String(doc["camStreamURL"] | runtimeConfig.camStreamURL.c_str());
+  camStreamURL.trim();
+  if (camStreamURL.length() == 0) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Camera stream URL is required\"}");
+    return;
+  }
+  runtimeConfig.camStreamURL = camStreamURL;
+
+  String camSnapshotURL = String(doc["camSnapshotURL"] | runtimeConfig.camSnapshotURL.c_str());
+  camSnapshotURL.trim();
+  if (camSnapshotURL.length() > 0) {
+    runtimeConfig.camSnapshotURL = camSnapshotURL;
+  }
+
+  if (!saveRuntimeConfig()) {
+    webServer.send(500, "application/json", "{\"ok\":false,\"error\":\"Failed to persist config\"}");
+    return;
+  }
+
+  stopCameraStream();
+  mqttClient.disconnect();
+  mqttConnected = false;
+  applyRuntimeConfig();
+  lastMqttAttempt = 0;
+
+  webServer.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleLog() {
