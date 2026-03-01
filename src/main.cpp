@@ -15,16 +15,43 @@
 #include <LittleFS.h>
 #include <PubSubClient.h>
 
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
+#ifndef MQTT_HOST
+#define MQTT_HOST "192.168.0.19"
+#endif
+
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+
+#ifndef MQTT_USER
+#define MQTT_USER ""
+#endif
+
+#ifndef MQTT_PASSWORD
+#define MQTT_PASSWORD ""
+#endif
+
 
 // --- CONFIGURATION ---
-const char* ssid = "FHogue";
-const char* password = "fdigger1";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 const int UDP_PORT = 4210;
 const char* camStreamURL = "http://192.168.0.196/stream";      // ESP32-CAM stream endpoint
 const char* camSnapshotURL = "http://192.168.0.196/capture"; // Optional snapshot endpoint
 
-const char* mqttHost = "192.168.0.15";
-const uint16_t mqttPort = 1883;
+const char* mqttHost = MQTT_HOST;
+const uint16_t mqttPort = MQTT_PORT;
+const char* mqttUser = MQTT_USER;
+const char* mqttPassword = MQTT_PASSWORD;
+const char* mqttClientIdBase = "4indisplay";
 const unsigned long MQTT_RETRY_MS = 5000;
 const char* TZ_INFO = "CST6CDT,M3.2.0/2,M11.1.0/2";
 const char* MQTT_STATUS_TOPIC = "gate/status";
@@ -55,6 +82,9 @@ void drawCamStatusOverlay();
 void showStartupLogo();
 void updateStartupStatus(const String &wifiStatus, const String &mqttStatus);
 bool connectMqtt(unsigned long timeoutMs);
+const char* mqttStateText(int8_t state);
+bool attemptMqttConnect();
+String sanitizeMqttField(const char* raw);
 void handleTouch(uint16_t x, uint16_t y);
 void drawMenu();
 void drawMenuButton(int pos, String label, uint16_t color);
@@ -253,6 +283,8 @@ void setup() {
     }
 
   mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setSocketTimeout(5);
+  mqttClient.setKeepAlive(30);
   mqttConnected = connectMqtt(8000);
   // updateStartupStatus("WiFi: " + String(WiFi.status() == WL_CONNECTED ? "connected" : "failed"),
   //                     String("MQTT: ") + (mqttConnected ? "connected" : "failed"));
@@ -283,9 +315,10 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
+      mqttConnected = false;
       if (millis() - lastMqttAttempt > MQTT_RETRY_MS) {
         lastMqttAttempt = millis();
-        mqttConnected = mqttClient.connect("4indisplay");
+        mqttConnected = attemptMqttConnect();
         if (mqttConnected) {
           publishStatus(true);
         }
@@ -411,11 +444,66 @@ bool connectMqtt(unsigned long timeoutMs) {
   if (WiFi.status() != WL_CONNECTED) return false;
   unsigned long start = millis();
   while (!mqttClient.connected() && millis() - start < timeoutMs) {
-    mqttConnected = mqttClient.connect("4indisplay");
+    mqttConnected = attemptMqttConnect();
     if (mqttConnected) return true;
     delay(300);
   }
   return mqttClient.connected();
+}
+
+String sanitizeMqttField(const char* raw) {
+  String value = raw ? String(raw) : String("");
+  value.trim();
+  while (value.length() >= 2) {
+    char first = value.charAt(0);
+    char last = value.charAt(value.length() - 1);
+    bool doubleQuoted = (first == '"' && last == '"');
+    bool singleQuoted = (first == '\'' && last == '\'');
+    if (!(doubleQuoted || singleQuoted)) break;
+    value = value.substring(1, value.length() - 1);
+    value.trim();
+  }
+  return value;
+}
+
+const char* mqttStateText(int8_t state) {
+  switch (state) {
+    case MQTT_CONNECTION_TIMEOUT: return "Connection timeout";
+    case MQTT_CONNECTION_LOST: return "Connection lost";
+    case MQTT_CONNECT_FAILED: return "Connect failed";
+    case MQTT_DISCONNECTED: return "Disconnected";
+    case MQTT_CONNECTED: return "Connected";
+    case MQTT_CONNECT_BAD_PROTOCOL: return "Bad protocol";
+    case MQTT_CONNECT_BAD_CLIENT_ID: return "Bad client ID";
+    case MQTT_CONNECT_UNAVAILABLE: return "Broker unavailable";
+    case MQTT_CONNECT_BAD_CREDENTIALS: return "Bad credentials";
+    case MQTT_CONNECT_UNAUTHORIZED: return "Unauthorized";
+    default: return "Unknown state";
+  }
+}
+
+bool attemptMqttConnect() {
+  String clientId = String(mqttClientIdBase) + "-" + String((uint32_t)(ESP.getEfuseMac() & 0xFFFFFF), HEX);
+  String mqttUserSanitized = sanitizeMqttField(mqttUser);
+  String mqttPasswordSanitized = sanitizeMqttField(mqttPassword);
+  bool useAuth = mqttUserSanitized.length() > 0;
+  bool ok = useAuth
+    ? mqttClient.connect(clientId.c_str(), mqttUserSanitized.c_str(), mqttPasswordSanitized.c_str())
+    : mqttClient.connect(clientId.c_str());
+
+  if (!ok) {
+    int8_t state = mqttClient.state();
+    Serial.printf("[MQTT] Connect failed: state=%d (%s) host=%s port=%u auth=%s\n",
+                  state,
+                  mqttStateText(state),
+                  mqttHost,
+                  mqttPort,
+                  useAuth ? "on" : "off");
+  } else {
+    Serial.printf("[MQTT] Connected: clientId=%s\n", clientId.c_str());
+  }
+
+  return ok;
 }
 
 void wakeScreen() {

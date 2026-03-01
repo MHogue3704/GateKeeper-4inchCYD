@@ -245,9 +245,20 @@ Edit the following constants in `src/main.cpp`:
 ```cpp
 const char* ssid = "YourWiFiSSID";
 const char* password = "YourWiFiPassword";
-const char* mqttHost = "192.168.0.15";  // Your MQTT broker IP
+const char* mqttHost = "192.168.0.19";  // Your MQTT broker IP
 const uint16_t mqttPort = 1883;
+const char* mqttUser = "your_mqtt_username";    // Required for most HAOS Mosquitto setups
+const char* mqttPassword = "your_mqtt_password";
 ```
+
+If your broker allows anonymous access, leave `mqttUser` and `mqttPassword` empty (`""`).
+
+### MQTT Troubleshooting (HAOS)
+
+- Ensure Home Assistant Mosquitto add-on is running and listening on `1883`
+- Use a dedicated user from Home Assistant (`Settings -> People -> Users`) with MQTT permissions
+- Confirm the broker IP is reachable from the ESP32 WiFi network
+- Check Serial output for MQTT state messages (e.g. `Bad credentials`, `Unauthorized`, `Broker unavailable`)
 
 ## Web Interface
 
